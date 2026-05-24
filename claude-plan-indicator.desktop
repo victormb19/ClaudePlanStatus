@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Claude Plan Status
+Comment=Muestra el uso del plan de Claude Code en la barra superior
+Exec=/usr/bin/python3 __PROJECT_DIR__/claude_plan_indicator.py
+Icon=__PROJECT_DIR__/icon.svg
+X-GNOME-Autostart-enabled=true
+NoDisplay=false
+Terminal=false
+Categories=Utility;
