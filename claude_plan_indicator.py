@@ -1,18 +1,19 @@
 #!/usr/bin/env python3
 """ClaudePlanStatus — indicador GNOME del uso del plan de Claude Code.
 
-Lee ccusage (binario nativo) y muestra en la barra superior:
-  - % de la ventana rodante de 5h
-  - % del cap semanal configurable
-Click para ver detalles, refrescar o editar config.
+Lee directamente el endpoint OAuth de Anthropic (api.anthropic.com/api/oauth/usage)
+con el token guardado por el CLI de Claude Code en ~/.claude/.credentials.json.
+Muestra los mismos % que ves en /usage o en tu pestaña de uso del perfil.
 """
 
 import json
-import shutil
+import ssl
 import subprocess
 import sys
 import tomllib
-from datetime import datetime, timedelta, timezone
+import urllib.error
+import urllib.request
+from datetime import datetime, timezone
 from pathlib import Path
 
 import gi
@@ -24,11 +25,18 @@ from gi.repository import GLib, Gtk, AyatanaAppIndicator3 as AppIndicator  # noq
 PROJECT_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = PROJECT_DIR / "config.toml"
 ICON_PATH = PROJECT_DIR / "icon.svg"
-CCUSAGE = shutil.which("ccusage") or str(Path.home() / ".local/bin/ccusage")
+CREDS_PATH = Path.home() / ".claude" / ".credentials.json"
+
+USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
+OAUTH_BETA_HEADER = "oauth-2025-04-20"
 
 DEFAULT_CONFIG = {
-    "limits": {"threshold_5h": "auto", "threshold_weekly": 5_000_000},
-    "ui": {"poll_seconds": 30, "show_cost": True},
+    "ui": {
+        "poll_seconds": 60,
+        "warn_pct": 70,
+        "alert_pct": 90,
+        "show_extras": True,
+    },
 }
 
 
@@ -46,65 +54,55 @@ def load_config():
     return cfg
 
 
-def run_ccusage(args):
-    result = subprocess.run(
-        [CCUSAGE, *args], capture_output=True, text=True, timeout=10
+def read_access_token():
+    with open(CREDS_PATH) as f:
+        return json.load(f)["claudeAiOauth"]["accessToken"]
+
+
+def fetch_usage():
+    token = read_access_token()
+    req = urllib.request.Request(
+        USAGE_URL,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "anthropic-beta": OAUTH_BETA_HEADER,
+            "Accept": "application/json",
+            "User-Agent": "ClaudePlanStatus/1.0",
+        },
     )
-    if result.returncode != 0:
-        raise RuntimeError(result.stderr.strip() or "ccusage falló")
-    return json.loads(result.stdout)
+    ctx = ssl.create_default_context()
+    with urllib.request.urlopen(req, timeout=10, context=ctx) as resp:
+        return json.loads(resp.read().decode())
 
 
-def fetch_active_block():
-    blocks = run_ccusage(["blocks", "--active", "--json", "--offline"]).get("blocks") or []
-    return blocks[0] if blocks else None
-
-
-def fetch_weekly_current():
-    data = run_ccusage(["weekly", "--json", "--offline"])
-    weeks = data.get("weekly") or []
-    if not weeks:
-        return {"totalTokens": 0, "totalCost": 0.0}
-    today = datetime.now(timezone.utc).date()
-    monday = (today - timedelta(days=today.weekday())).isoformat()
-    for w in weeks:
-        if w.get("period") == monday:
-            return w
-    weeks.sort(key=lambda x: x.get("period", ""), reverse=True)
-    return weeks[0]
-
-
-def fetch_threshold_5h_auto():
-    blocks = run_ccusage(["blocks", "--json", "--offline"]).get("blocks") or []
-    historical = [b.get("totalTokens") or 0 for b in blocks if not b.get("isGap") and not b.get("isActive")]
-    return max(historical) if historical else 1_000_000
-
-
-def fmt_tokens(n):
-    if n >= 1_000_000:
-        return f"{n / 1_000_000:.1f}M"
-    if n >= 1_000:
-        return f"{n / 1_000:.0f}k"
-    return str(n)
-
-
-def fmt_remaining(end_iso):
+def fmt_reset(iso_str):
+    """Devuelve "queda 2h 15m" para timestamps futuros."""
+    if not iso_str:
+        return "—"
     try:
-        end = datetime.fromisoformat(end_iso.replace("Z", "+00:00"))
+        dt = datetime.fromisoformat(iso_str.replace("Z", "+00:00"))
     except ValueError:
         return "—"
-    delta = end - datetime.now(timezone.utc)
-    if delta.total_seconds() <= 0:
-        return "expirado"
-    mins = int(delta.total_seconds() // 60)
+    delta = dt - datetime.now(timezone.utc)
+    secs = int(delta.total_seconds())
+    if secs <= 0:
+        return "resetea ya"
+    mins = secs // 60
+    if mins < 60:
+        return f"queda {mins}m"
     h, m = divmod(mins, 60)
-    return f"{h}h {m}m" if h else f"{m}m"
+    if h < 24:
+        return f"queda {h}h {m}m"
+    d, h = divmod(h, 24)
+    return f"queda {d}d {h}h"
 
 
-def emoji_for_pct(pct):
-    if pct >= 90:
+def emoji_for_pct(pct, warn, alert):
+    if pct is None:
+        return "❔"
+    if pct >= alert:
         return "🔴"
-    if pct >= 70:
+    if pct >= warn:
         return "🟡"
     return "🟢"
 
@@ -122,22 +120,32 @@ class Indicator:
         self._build_menu()
         self.indicator.set_label("⏳ Claude", "")
         self.poll()
-        interval = max(5, int(self.config["ui"].get("poll_seconds", 30)))
+        interval = max(15, int(self.config["ui"].get("poll_seconds", 60)))
         GLib.timeout_add_seconds(interval, self.poll)
 
     def _build_menu(self):
         self.menu = Gtk.Menu()
         self.item_5h = Gtk.MenuItem(label="5h: cargando…")
+        self.item_5h_reset = Gtk.MenuItem(label="")
         self.item_weekly = Gtk.MenuItem(label="Semanal: cargando…")
-        self.item_cost = Gtk.MenuItem(label="Coste: —")
+        self.item_weekly_reset = Gtk.MenuItem(label="")
+        self.item_extras = Gtk.MenuItem(label="")
         self.item_updated = Gtk.MenuItem(label="Actualizado: —")
-        for item in (self.item_5h, self.item_weekly, self.item_cost, self.item_updated):
+        for item in (
+            self.item_5h,
+            self.item_5h_reset,
+            self.item_weekly,
+            self.item_weekly_reset,
+            self.item_extras,
+            self.item_updated,
+        ):
             item.set_sensitive(False)
             self.menu.append(item)
         self.menu.append(Gtk.SeparatorMenuItem())
         for label, handler in (
             ("Refrescar ahora", lambda _: self.poll()),
             ("Editar config…", self._open_config),
+            ("Abrir uso en claude.ai", self._open_web_usage),
             ("Salir", lambda _: Gtk.main_quit()),
         ):
             item = Gtk.MenuItem(label=label)
@@ -147,68 +155,101 @@ class Indicator:
         self.indicator.set_menu(self.menu)
 
     def _open_config(self, _item):
-        if not CONFIG_PATH.exists():
-            CONFIG_PATH.write_text(
-                '[limits]\nthreshold_5h = "auto"\nthreshold_weekly = 5000000\n\n'
-                "[ui]\npoll_seconds = 30\nshow_cost = true\n"
-            )
         subprocess.Popen(["xdg-open", str(CONFIG_PATH)])
+
+    def _open_web_usage(self, _item):
+        subprocess.Popen(["xdg-open", "https://claude.ai/settings/usage"])
 
     def poll(self):
         try:
             self.config = load_config()
-            block = fetch_active_block()
-            weekly = fetch_weekly_current()
-            cfg = self.config["limits"]
-            t5 = cfg.get("threshold_5h", "auto")
-            if isinstance(t5, str) and t5.lower() == "auto":
-                t5 = fetch_threshold_5h_auto()
-            tw = int(cfg.get("threshold_weekly", 5_000_000))
-            self._render(block, weekly, int(t5), tw)
-        except Exception as e:
-            self.indicator.set_label("⚠ Claude", "")
-            self.item_5h.set_label(f"Error: {e}")
-            self.item_weekly.set_label("")
-            self.item_cost.set_label("")
-            self.item_updated.set_label(f"Intento: {datetime.now().strftime('%H:%M:%S')}")
+            data = fetch_usage()
+            self._render(data)
+        except urllib.error.HTTPError as e:
+            if e.code == 401:
+                self._error("token expirado — abre `claude` 1 vez")
+            else:
+                self._error(f"HTTP {e.code}")
+        except FileNotFoundError:
+            self._error(f"falta {CREDS_PATH}")
+        except Exception as e:  # noqa: BLE001
+            self._error(str(e)[:60])
         return True
 
-    def _render(self, block, weekly, t5, tw):
-        if block:
-            tk5 = block.get("totalTokens", 0)
-            remaining = fmt_remaining(block.get("endTime", ""))
-            cost = block.get("costUSD", 0.0)
-        else:
-            tk5, remaining, cost = 0, "sin bloque activo", 0.0
-        pct5 = (tk5 / t5 * 100) if t5 else 0
+    def _error(self, msg):
+        self.indicator.set_label("⚠ Claude", "")
+        self.item_5h.set_label(f"Error: {msg}")
+        self.item_5h_reset.set_label("")
+        self.item_weekly.set_label("")
+        self.item_weekly_reset.set_label("")
+        self.item_extras.set_label("")
+        self.item_updated.set_label(
+            f"Intento: {datetime.now().strftime('%H:%M:%S')}"
+        )
 
-        tkw = weekly.get("totalTokens", 0)
-        costw = weekly.get("totalCost", 0.0)
-        pctw = (tkw / tw * 100) if tw else 0
+    def _render(self, data):
+        ui = self.config["ui"]
+        warn = float(ui.get("warn_pct", 70))
+        alert = float(ui.get("alert_pct", 90))
 
-        emoji = emoji_for_pct(max(pct5, pctw))
-        self.indicator.set_label(f"{emoji} 5h {pct5:.0f}% · 7d {pctw:.0f}%", "")
+        five = data.get("five_hour") or {}
+        seven = data.get("seven_day") or {}
+        pct5 = five.get("utilization")
+        pct7 = seven.get("utilization")
+
+        worst = max(p for p in (pct5, pct7) if p is not None) if (pct5 is not None or pct7 is not None) else None
+        self.indicator.set_label(
+            f"{emoji_for_pct(worst, warn, alert)} "
+            f"5h {pct5:.0f}% · 7d {pct7:.0f}%"
+            if pct5 is not None and pct7 is not None
+            else f"{emoji_for_pct(worst, warn, alert)} Claude",
+            "",
+        )
+
         self.item_5h.set_label(
-            f"Bloque 5h: {fmt_tokens(tk5)} tokens ({pct5:.0f}%) · queda {remaining}"
+            f"Ventana 5h: {pct5:.1f}%" if pct5 is not None else "Ventana 5h: —"
+        )
+        self.item_5h_reset.set_label(
+            f"   {fmt_reset(five.get('resets_at'))}" if five.get("resets_at") else ""
         )
         self.item_weekly.set_label(
-            f"Semanal: {fmt_tokens(tkw)} tokens ({pctw:.0f}%)"
+            f"Semanal: {pct7:.1f}%" if pct7 is not None else "Semanal: —"
         )
-        if self.config["ui"].get("show_cost", True):
-            self.item_cost.set_label(
-                f"Coste: ${cost:.2f} bloque · ${costw:.2f} semana"
-            )
-            self.item_cost.show()
+        self.item_weekly_reset.set_label(
+            f"   {fmt_reset(seven.get('resets_at'))}" if seven.get("resets_at") else ""
+        )
+
+        if ui.get("show_extras", True):
+            extras = []
+            extra = data.get("extra_usage") or {}
+            if extra.get("is_enabled"):
+                ext_pct = extra.get("utilization")
+                if ext_pct is not None:
+                    extras.append(f"Extra: {ext_pct:.0f}%")
+            for key, label in (
+                ("seven_day_opus", "Opus 7d"),
+                ("seven_day_sonnet", "Sonnet 7d"),
+            ):
+                sub = data.get(key) or {}
+                p = sub.get("utilization") if isinstance(sub, dict) else None
+                if p is not None:
+                    extras.append(f"{label}: {p:.0f}%")
+            self.item_extras.set_label(" · ".join(extras) if extras else "")
+            self.item_extras.set_visible(bool(extras))
         else:
-            self.item_cost.hide()
+            self.item_extras.hide()
+
         self.item_updated.set_label(
             f"Actualizado: {datetime.now().strftime('%H:%M:%S')}"
         )
 
 
 def main():
-    if not Path(CCUSAGE).exists():
-        print(f"ccusage no encontrado en {CCUSAGE}. Ejecuta install.sh.", file=sys.stderr)
+    if not CREDS_PATH.exists():
+        print(
+            f"No encuentro {CREDS_PATH}. ¿Tienes Claude Code logueado?",
+            file=sys.stderr,
+        )
         sys.exit(1)
     Indicator()
     Gtk.main()

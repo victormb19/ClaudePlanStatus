@@ -1,16 +1,13 @@
-[limits]
-# Umbral de tokens para la ventana rodante de 5h (proxy del cap de tu plan).
-# "auto" usa el mayor bloque histórico ya consumido como referencia.
-# Pon un número (p.ej. 50000000) para fijarlo manualmente.
-threshold_5h = "auto"
-
-# Umbral de tokens para la semana actual (lunes-domingo UTC).
-# Ajústalo tras una semana de uso real con datos reales de tu plan.
-threshold_weekly = 5000000
-
 [ui]
-# Cada cuántos segundos refrescar los datos.
-poll_seconds = 30
+# Cada cuántos segundos refrescar (mín 15). Anthropic actualiza los % cada
+# pocos minutos, así que 60s es un buen balance.
+poll_seconds = 60
 
-# Mostrar coste estimado en el menú.
-show_cost = true
+# Umbrales de aviso (icono amarillo) y alerta (icono rojo) sobre el % más alto
+# entre la ventana de 5h y la semanal.
+warn_pct = 70
+alert_pct = 90
+
+# Mostrar líneas extra en el menú con caps adicionales (extra_usage, opus 7d,
+# sonnet 7d) cuando estén presentes en tu plan.
+show_extras = true

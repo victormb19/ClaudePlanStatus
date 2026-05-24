@@ -1,30 +1,38 @@
 # ClaudePlanStatus
 
-Indicador para GNOME que muestra en la barra superior cuánto has consumido de tu
-plan de Claude Code: ventana rodante de 5 horas y total semanal. Los datos salen
-de [`ccusage`](https://github.com/ryoppippi/ccusage) leyendo los JSONL locales
-en `~/.claude/projects/` — no llama a ninguna API.
+Indicador para GNOME que muestra en la barra superior los mismos porcentajes de
+uso del plan de Claude Code que ves dentro de la sesión con `/usage` o en
+[claude.ai/settings/usage](https://claude.ai/settings/usage): ventana de 5 horas
+y cap semanal de 7 días.
 
 ```
-🟢 5h 12% · 7d 35%      ← en la barra superior de GNOME
+🟢 5h 3% · 7d 62%      ← en la barra superior de GNOME
 ```
 
-Al hacer clic se despliega el menú con detalles:
+Al hacer clic se despliega el menú con detalle:
 
-- Tokens consumidos en el bloque activo de 5h y tiempo restante.
-- Tokens consumidos en la semana actual.
-- Coste estimado (bloque y semana).
-- Acciones: Refrescar ahora, Editar config, Salir.
+- Ventana 5h: `XX.X%` y cuándo resetea
+- Semanal: `YY.Y%` y cuándo resetea
+- Caps extra (Opus 7d, Sonnet 7d, extra_usage) si aplican a tu plan
+- Acciones: Refrescar ahora, Editar config, Abrir uso en claude.ai, Salir
+
+## ¿De dónde salen los datos?
+
+Llama directamente al endpoint `GET https://api.anthropic.com/api/oauth/usage`
+usando el access token OAuth que Claude Code ya tiene guardado en
+`~/.claude/.credentials.json`. **No requiere API key, no consume cuota.**
 
 ## Requisitos
 
 - Ubuntu 24.04+ con GNOME Shell y la extensión AppIndicator (incluida en Ubuntu).
 - Python 3.11+ (Ubuntu 24.04 trae 3.12).
-- `sudo` para una sola instalación de paquete del sistema.
+- Claude Code instalado y logueado (`claude` al menos una vez para crear
+  `~/.claude/.credentials.json`).
 
 ## Instalación
 
 ```bash
+git clone https://github.com/victormb19/ClaudePlanStatus.git ~/Documentos/ClaudePlanStatus
 cd ~/Documentos/ClaudePlanStatus
 ./install.sh
 ```
@@ -32,10 +40,7 @@ cd ~/Documentos/ClaudePlanStatus
 El script:
 
 1. Instala `gir1.2-ayatanaappindicator3-0.1` vía apt (te pedirá la contraseña).
-2. Instala [Bun](https://bun.sh) en `~/.bun` si no lo tienes.
-3. Instala `ccusage` globalmente con Bun.
-4. Crea un symlink del binario nativo en `~/.local/bin/ccusage`.
-5. Registra el `.desktop` en `~/.config/autostart/` para que arranque al iniciar sesión.
+2. Registra el `.desktop` en `~/.config/autostart/` para que arranque al iniciar sesión.
 
 Para probarlo sin reiniciar la sesión:
 
@@ -43,29 +48,24 @@ Para probarlo sin reiniciar la sesión:
 python3 ~/Documentos/ClaudePlanStatus/claude_plan_indicator.py &
 ```
 
-## Configuración
-
-Edita `config.toml` (o usa "Editar config…" desde el menú):
+## Configuración (`config.toml`)
 
 ```toml
-[limits]
-threshold_5h = "auto"        # "auto" = usa tu mayor bloque histórico
-threshold_weekly = 5000000   # tokens; ajusta según tu plan real
-
 [ui]
-poll_seconds = 30
-show_cost = true
+poll_seconds = 60   # cada cuántos segundos refrescar (mín 15)
+warn_pct = 70       # icono 🟡 a partir de este %
+alert_pct = 90      # icono 🔴 a partir de este %
+show_extras = true  # mostrar caps extra en el menú si existen
 ```
 
-Los cambios se aplican en el siguiente poll (o pulsa "Refrescar ahora").
+Cambios se aplican en el siguiente poll, o pulsa "Refrescar ahora".
 
-## Sobre los "%"
+## Manejo de tokens
 
-Anthropic no publica los caps de Pro/Max como número de tokens — el plan se mide
-internamente por mensajes opacos. Este indicador muestra **tokens consumidos**
-contra umbrales que configuras tú. El default `"auto"` para 5h toma como
-referencia tu mayor bloque histórico (igual que `ccusage blocks -t max`), lo
-que da un proxy razonable de tu uso máximo personal.
+El indicador re-lee `~/.claude/.credentials.json` en cada poll, así que cuando
+Claude Code refresca el token automáticamente, el indicador lo recoge sin
+reiniciar. Si el token expira y no estás usando el CLI, verás `⚠ Claude` con
+"token expirado" — basta con abrir `claude` una vez para que se renueve.
 
 ## Desinstalar
 
@@ -73,7 +73,6 @@ que da un proxy razonable de tu uso máximo personal.
 rm ~/.config/autostart/claude-plan-indicator.desktop
 pkill -f claude_plan_indicator.py
 rm -rf ~/Documentos/ClaudePlanStatus
-# Opcional: rm ~/.local/bin/ccusage  &&  ~/.bun/bin/bun pm uninstall -g ccusage
 ```
 
 ## Estructura
