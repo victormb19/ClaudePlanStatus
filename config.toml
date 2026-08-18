@@ -1,7 +1,7 @@
 [ui]
 # Cada cuántos segundos refrescar (mín 15). Anthropic actualiza los % cada
 # pocos minutos, así que 60s es un buen balance.
-poll_seconds = 60
+poll_seconds = 300
 
 # Umbrales de aviso (icono amarillo) y alerta (icono rojo) sobre el % más alto
 # entre la ventana de 5h y la semanal.
@@ -11,3 +11,19 @@ alert_pct = 90
 # Mostrar líneas extra en el menú con caps adicionales (extra_usage, opus 7d,
 # sonnet 7d) cuando estén presentes en tu plan.
 show_extras = true
+
+# Si la API falla (token OAuth caducado, sin red…) se sigue mostrando el último
+# % conocido con este sufijo. Pon "" para no marcarlo.
+stale_marker = "*"
+
+# Horas máximas que se considera válido un dato cacheado (0 = sin límite, se
+# muestra siempre). Pasado ese tiempo vuelve a "⚠ Claude".
+stale_max_age_hours = 0
+
+# Renovar solo el token OAuth con el refreshToken de ~/.claude/.credentials.json
+# cuando esté a punto de caducar o la API devuelva 401. Reescribe ese archivo
+# (deja copia en .credentials.json.bak). Pon false para no tocarlo nunca.
+auto_refresh_token = true
+
+# Segundos antes de expirar en los que ya se renueva de forma preventiva.
+refresh_margin_seconds = 300
