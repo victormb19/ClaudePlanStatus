@@ -355,6 +355,23 @@ class Indicator:
             f"Intento: {datetime.now().strftime('%H:%M:%S')}"
         )
 
+    @staticmethod
+    def _extras(data):
+        """[(etiqueta, %)] de los caps extra que el plan tenga activos."""
+        out = []
+        extra = data.get("extra_usage") or {}
+        if extra.get("is_enabled") and extra.get("utilization") is not None:
+            out.append(("Extra", float(extra["utilization"])))
+        for key, label in (
+            ("seven_day_opus", "Opus 7d"),
+            ("seven_day_sonnet", "Sonnet 7d"),
+        ):
+            sub = data.get(key) or {}
+            p = sub.get("utilization") if isinstance(sub, dict) else None
+            if p is not None:
+                out.append((label, float(p)))
+        return out
+
     def _render(self, data, stale=None):
         ui = self.config["ui"]
         warn = float(ui.get("warn_pct", 70))
@@ -365,13 +382,23 @@ class Indicator:
         pct5 = five.get("utilization")
         pct7 = seven.get("utilization")
 
-        worst = max(p for p in (pct5, pct7) if p is not None) if (pct5 is not None or pct7 is not None) else None
+        extras = self._extras(data) if ui.get("show_extras", True) else []
+
+        pcts = [p for p in (pct5, pct7) if p is not None]
+        pcts += [p for _, p in extras]
+        worst = max(pcts) if pcts else None
         marker = str(ui.get("stale_marker", "*")) if stale else ""
+
+        parts = []
+        if pct5 is not None:
+            parts.append(f"5h {pct5:.0f}%")
+        if pct7 is not None:
+            parts.append(f"7d {pct7:.0f}%")
+        parts += [f"{label} {p:.0f}%" for label, p in extras]
         self.indicator.set_label(
             f"{emoji_for_pct(worst, warn, alert)} "
-            f"5h {pct5:.0f}% · 7d {pct7:.0f}%{marker}"
-            if pct5 is not None and pct7 is not None
-            else f"{emoji_for_pct(worst, warn, alert)} Claude{marker}",
+            + (" · ".join(parts) if parts else "Claude")
+            + marker,
             "",
         )
 
@@ -388,25 +415,14 @@ class Indicator:
             f"   {fmt_reset(seven.get('resets_at'))}" if seven.get("resets_at") else ""
         )
 
-        if ui.get("show_extras", True):
-            extras = []
-            extra = data.get("extra_usage") or {}
-            if extra.get("is_enabled"):
-                ext_pct = extra.get("utilization")
-                if ext_pct is not None:
-                    extras.append(f"Extra: {ext_pct:.0f}%")
-            for key, label in (
-                ("seven_day_opus", "Opus 7d"),
-                ("seven_day_sonnet", "Sonnet 7d"),
-            ):
-                sub = data.get(key) or {}
-                p = sub.get("utilization") if isinstance(sub, dict) else None
-                if p is not None:
-                    extras.append(f"{label}: {p:.0f}%")
-            self.item_extras.set_label(" · ".join(extras) if extras else "")
-            self.item_extras.set_visible(bool(extras))
+        if extras:
+            self.item_extras.set_label(
+                " · ".join(f"{label}: {p:.1f}%" for label, p in extras)
+            )
+            self.item_extras.set_visible(True)
         else:
-            self.item_extras.hide()
+            self.item_extras.set_label("")
+            self.item_extras.set_visible(False)
 
         if stale:
             ts, msg = stale
