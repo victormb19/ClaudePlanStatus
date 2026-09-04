@@ -77,11 +77,22 @@ def read_credentials():
 def read_access_token():
     return read_credentials()["claudeAiOauth"]["accessToken"]
 
+def _oauth_looks_usable(creds):
+    """El CLI puede dejar el bloque OAuth con cadenas vacías: eso no es un token."""
+    block = creds.get("claudeAiOauth") or {}
+    return bool(block.get("accessToken")) and bool(block.get("refreshToken"))
+
 
 def token_expires_within(creds, margin_seconds):
-    """True si el accessToken caduca dentro del margen (expiresAt viene en ms)."""
+    """True si el accessToken caduca dentro del margen (expiresAt viene en ms).
+
+    El CLI a veces deja expiresAt en 0 (o ausente): eso no significa "caducado",
+    significa "no lo sé". Tratarlo como caducado hacía refrescar el token en cada
+    poll, lo que acaba en 429 del endpoint. Con expiry desconocido se usa el token
+    tal cual y sólo se refresca de forma reactiva si la API devuelve 401.
+    """
     expires_at = (creds.get("claudeAiOauth") or {}).get("expiresAt")
-    if not isinstance(expires_at, (int, float)):
+    if not isinstance(expires_at, (int, float)) or expires_at <= 0:
         return False
     return time.time() * 1000 >= expires_at - margin_seconds * 1000
 
@@ -93,7 +104,10 @@ def save_credentials(creds):
     clave que no sea del bloque OAuth y se deja una copia previa en .bak por si
     la rotación del refresh token dejase el archivo inservible.
     """
-    shutil.copy2(CREDS_PATH, CREDS_BACKUP_PATH)
+    if _oauth_looks_usable(read_credentials()):
+        # Sólo se respalda un archivo sano: si el actual ya está vaciado, copiarlo
+        # encima destruiría la única copia con tokens buenos.
+        shutil.copy2(CREDS_PATH, CREDS_BACKUP_PATH)
     tmp = CREDS_PATH.with_name(CREDS_PATH.name + ".tmp")
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     with os.fdopen(fd, "w") as f:
@@ -112,7 +126,7 @@ def refresh_access_token():
     block = creds.get("claudeAiOauth") or {}
     refresh_token = block.get("refreshToken")
     if not refresh_token:
-        raise RuntimeError("no hay refreshToken en .credentials.json")
+        raise RuntimeError("sesión OAuth vacía — ejecuta `claude` para relogin")
 
     payload = json.dumps(
         {
@@ -169,7 +183,7 @@ def fetch_usage(auto_refresh=True, refresh_margin=300):
     if auto_refresh and (not token or token_expires_within(creds, refresh_margin)):
         return _request_usage(refresh_access_token())
     if not token:
-        raise RuntimeError("no hay accessToken en .credentials.json")
+        raise RuntimeError("sesión OAuth vacía — ejecuta `claude` para relogin")
     try:
         return _request_usage(token)
     except urllib.error.HTTPError as e:
@@ -260,6 +274,8 @@ class Indicator:
         self.indicator.set_title("Claude Plan Status")
         self._build_menu()
         self.indicator.set_label("⏳ Claude", "")
+        self._backoff_until = 0.0
+        self._fail_streak = 0
         cached = load_cache()
         if cached is not None:
             self._render(cached[1], stale=(cached[0], "cargando…"))
@@ -287,7 +303,7 @@ class Indicator:
             self.menu.append(item)
         self.menu.append(Gtk.SeparatorMenuItem())
         for label, handler in (
-            ("Refrescar ahora", lambda _: self.poll()),
+            ("Refrescar ahora", lambda _: self._poll_now()),
             ("Renovar token ahora", self._force_refresh_token),
             ("Editar config…", self._open_config),
             ("Abrir uso en claude.ai", self._open_web_usage),
@@ -299,13 +315,18 @@ class Indicator:
         self.menu.show_all()
         self.indicator.set_menu(self.menu)
 
+    def _poll_now(self):
+        """Refresco manual: ignora el backoff en curso."""
+        self._backoff_until = 0.0
+        self.poll()
+
     def _force_refresh_token(self, _item):
         try:
             refresh_access_token()
         except Exception as e:  # noqa: BLE001
             self._error(f"refresh falló: {str(e)[:40]}")
             return
-        self.poll()
+        self._poll_now()
 
     def _open_config(self, _item):
         subprocess.Popen(["xdg-open", str(CONFIG_PATH)])
@@ -314,6 +335,8 @@ class Indicator:
         subprocess.Popen(["xdg-open", "https://claude.ai/settings/usage"])
 
     def poll(self):
+        if time.time() < self._backoff_until:
+            return True
         try:
             self.config = load_config()
             ui = self.config["ui"]
@@ -322,19 +345,37 @@ class Indicator:
                 refresh_margin=float(ui.get("refresh_margin_seconds", 300)),
             )
             save_cache(data)
+            self._fail_streak = 0
+            self._backoff_until = 0.0
             self._render(data)
         except urllib.error.HTTPError as e:
             if e.code in (400, 401, 403) and "oauth/token" in (e.url or ""):
-                self._error("refresh rechazado — abre `claude` 1 vez")
+                self._fail(429 if e.code == 429 else 0, "refresh rechazado — abre `claude` 1 vez")
             elif e.code == 401:
-                self._error("token expirado — abre `claude` 1 vez")
+                self._fail(0, "token expirado — abre `claude` 1 vez")
+            elif e.code == 429:
+                self._fail(429, "rate limit — reintento diferido")
             else:
-                self._error(f"HTTP {e.code}")
+                self._fail(e.code, f"HTTP {e.code}")
         except FileNotFoundError:
-            self._error(f"falta {CREDS_PATH}")
+            self._fail(0, f"falta {CREDS_PATH}")
         except Exception as e:  # noqa: BLE001
-            self._error(str(e)[:60])
+            self._fail(0, str(e)[:60])
         return True
+
+    def _fail(self, code, msg):
+        """Marca el fallo y espacia el siguiente intento (backoff exponencial).
+
+        Sin esto un 429 se repetía cada poll_seconds y el rate limit no se
+        soltaba nunca. Arranca en 2 polls y sube hasta 30 min.
+        """
+        self._fail_streak += 1
+        base = max(15, int(self.config["ui"].get("poll_seconds", 60)))
+        wait = min(1800, base * (2 ** min(self._fail_streak, 6)))
+        self._backoff_until = time.time() + wait
+        if code == 429:
+            msg = f"{msg} ({wait // 60}m)"
+        self._error(msg)
 
     def _error(self, msg):
         """Sigue mostrando el último % conocido; sólo marca que está obsoleto."""
