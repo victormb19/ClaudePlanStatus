@@ -127,6 +127,11 @@ def refresh_access_token():
     refresh_token = block.get("refreshToken")
     if not refresh_token:
         raise RuntimeError("sesión OAuth vacía — ejecuta `claude` para relogin")
+    refresh_expires_at = block.get("refreshTokenExpiresAt")
+    if isinstance(refresh_expires_at, (int, float)) and 0 < refresh_expires_at <= time.time() * 1000:
+        # Con el refresh token caducado el endpoint sólo va a rechazarlo: no
+        # gastar peticiones y decir directamente qué hacer.
+        raise RuntimeError("sesión caducada — ejecuta `claude` y haz /login")
 
     payload = json.dumps(
         {
@@ -436,8 +441,10 @@ class Indicator:
         if pct7 is not None:
             parts.append(f"7d {pct7:.0f}%")
         parts += [f"{label} {p:.0f}%" for label, p in extras]
+        # Con dato obsoleto el semáforo verde haría pasar un 0% viejo por real.
+        emoji = "⚠" if stale else emoji_for_pct(worst, warn, alert)
         self.indicator.set_label(
-            f"{emoji_for_pct(worst, warn, alert)} "
+            f"{emoji} "
             + (" · ".join(parts) if parts else "Claude")
             + marker,
             "",
