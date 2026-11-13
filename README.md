@@ -89,6 +89,20 @@ abajo. En el menú tienes "Renovar token ahora" para forzarlo a mano.
 Si el refresh falla (refresh token revocado o ya gastado), verás
 `refresh rechazado — abre \`claude\` 1 vez`.
 
+### Arranque de sesión sin red todavía
+
+El autostart de GNOME suele lanzar el indicador antes de que NetworkManager
+conecte la Wi-Fi. Si el token caducó mientras el equipo estaba apagado, el
+primer intento de renovarlo falla por red, no por el token. En ese caso el
+indicador:
+
+- muestra `sin red — esperando conexión` (o `sin red (…) — reintento en 30s`)
+  sobre el último % cacheado, sin entrar en el backoff largo de la API;
+- escucha a NetworkManager (`Gio.NetworkMonitor`) y, 3 s después de que haya
+  red, renueva el token y refresca solo.
+
+No hace falta pulsar "Renovar token ahora" tras encender el equipo.
+
 ### Si aun así no hay datos frescos
 
 El indicador **sigue

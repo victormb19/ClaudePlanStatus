@@ -23,7 +23,7 @@ import gi
 
 gi.require_version("Gtk", "3.0")
 gi.require_version("AyatanaAppIndicator3", "0.1")
-from gi.repository import GLib, Gtk, AyatanaAppIndicator3 as AppIndicator  # noqa: E402
+from gi.repository import Gio, GLib, Gtk, AyatanaAppIndicator3 as AppIndicator  # noqa: E402
 
 PROJECT_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = PROJECT_DIR / "config.toml"
@@ -281,9 +281,18 @@ class Indicator:
         self.indicator.set_label("⏳ Claude", "")
         self._backoff_until = 0.0
         self._fail_streak = 0
+        self._net_fail_streak = 0
+        self._last_ok = None
         cached = load_cache()
         if cached is not None:
             self._render(cached[1], stale=(cached[0], "cargando…"))
+        # Al iniciar sesión el autostart suele correr antes de que NetworkManager
+        # levante la Wi-Fi. Sin esto el primer poll fallaba, entraba en backoff y
+        # el token caducado de la noche no se renovaba hasta 10-20 min después (o
+        # hasta pulsar "Renovar token ahora").
+        self._netmon = Gio.NetworkMonitor.get_default()
+        self._netmon.connect("network-changed", self._on_network_changed)
+        self._net_wait_source = None
         self.poll()
         interval = max(15, int(self.config["ui"].get("poll_seconds", 60)))
         GLib.timeout_add_seconds(interval, self.poll)
@@ -325,6 +334,24 @@ class Indicator:
         self._backoff_until = 0.0
         self.poll()
 
+    def _on_network_changed(self, _monitor, available):
+        """Al recuperar la red, repoll en unos segundos si el último intento falló.
+
+        Se espera un poco porque "network-changed" llega antes de que DNS y la
+        ruta por defecto estén listos; un poll inmediato fallaría igual.
+        """
+        if not available or (self._fail_streak == 0 and self._last_ok is not None):
+            return
+        if self._net_wait_source is not None:
+            GLib.source_remove(self._net_wait_source)
+
+        def fire():
+            self._net_wait_source = None
+            self._poll_now()
+            return False
+
+        self._net_wait_source = GLib.timeout_add_seconds(3, fire)
+
     def _force_refresh_token(self, _item):
         try:
             refresh_access_token()
@@ -342,6 +369,11 @@ class Indicator:
     def poll(self):
         if time.time() < self._backoff_until:
             return True
+        if not self._netmon.get_network_available():
+            # Sin red no es un fallo del token: no gastar backoff, esperar la
+            # señal de NetworkManager.
+            self._error("sin red — esperando conexión")
+            return True
         try:
             self.config = load_config()
             ui = self.config["ui"]
@@ -351,7 +383,9 @@ class Indicator:
             )
             save_cache(data)
             self._fail_streak = 0
+            self._net_fail_streak = 0
             self._backoff_until = 0.0
+            self._last_ok = time.time()
             self._render(data)
         except urllib.error.HTTPError as e:
             if e.code in (400, 401, 403) and "oauth/token" in (e.url or ""):
@@ -364,9 +398,24 @@ class Indicator:
                 self._fail(e.code, f"HTTP {e.code}")
         except FileNotFoundError:
             self._fail(0, f"falta {CREDS_PATH}")
+        except OSError as e:
+            # URLError, timeout, DNS, SSL handshake…: red a medio levantar.
+            # Reintento corto en vez del backoff largo reservado para la API.
+            self._fail_network(e)
         except Exception as e:  # noqa: BLE001
             self._fail(0, str(e)[:60])
         return True
+
+    def _fail_network(self, exc):
+        """Error de red (no de la API): reintento rápido, 30s·n, tope poll_seconds."""
+        self._fail_streak += 1
+        self._net_fail_streak += 1
+        base = max(15, int(self.config["ui"].get("poll_seconds", 60)))
+        wait = min(base, 30 * self._net_fail_streak)
+        self._backoff_until = time.time() + wait
+        reason = getattr(exc, "reason", None) or exc
+        self._error(f"sin red ({str(reason)[:30]}) — reintento en {wait}s")
+        GLib.timeout_add_seconds(wait, lambda: (self.poll(), False)[1])
 
     def _fail(self, code, msg):
         """Marca el fallo y espacia el siguiente intento (backoff exponencial).
